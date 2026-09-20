@@ -8,6 +8,10 @@ binary paths, users and labels. The only differences:
 - The Rust 1.92.0 toolchain and the Z3 4.16.0 source are downloaded from the
   URLs pinned in `deploy/konflux/*/generic-fetcher.yaml` and verified against
   the same sha256, instead of being read from the Hermeto prefetch directory.
+  The Konflux gateway image takes Rust from the UBI AppStream `rust`/`cargo`
+  RPMs (also 1.92.0); the GitHub Actions gateway uses the same upstream
+  tarball as the supervisor and CLI so all three binaries share one compiler
+  regardless of UBI repository drift, and installs `xz` to extract it.
 - Cargo registry and target directories use BuildKit cache mounts.
 - Gateway and supervisor build with `--locked`.
 

@@ -24,7 +24,7 @@ jobs:
       OPENSHELL_TELEMETRY_ENABLED: "false"
       CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -34,5 +34,7 @@ jobs:
           rustup toolchain install "$(grep -E '^channel' rust-toolchain.toml | sed -E 's/.*"([^"]+)".*/\1/')" --profile minimal
           rustup show active-toolchain
       - name: Run persistence tests
+        shell: bash
         run: |
+          set -o pipefail
           cargo test -p openshell-server --features test-support,bundled-z3 persistence -- --nocapture 2>&1 | tail -n 200
