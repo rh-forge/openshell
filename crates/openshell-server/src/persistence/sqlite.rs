@@ -59,11 +59,14 @@ pub(super) async fn replace_pool_connection(store: &SqliteStore) -> PersistenceR
 /// durability guarantees use the Postgres backend.
 ///
 /// `journal_mode=WAL` is persistent in the database file, but switching into
-/// it takes an exclusive lock that `busy_timeout` cannot wait for. The pool
-/// opens `min_connections` eagerly and concurrently, so the switch happens
-/// here on a single connection first; the pool connections then find the file
-/// already in WAL mode. `synchronous` is a per-connection setting and is
-/// applied through the options on every connection.
+/// it needs exclusive access: if another connection holds the file open, the
+/// switch waits out `busy_timeout` and then fails. Doing it up front on one
+/// connection means the pool connections only ever re-apply the pragma to a
+/// file that is already in WAL mode, which never blocks, and a failure
+/// surfaces as a single clear connect error instead of a pool error later.
+/// The first start after upgrading a rollback-journal database therefore needs
+/// the file to be otherwise unopened. `synchronous` is a per-connection
+/// setting and is applied through the options on every connection.
 ///
 /// In-memory databases are left on their defaults: WAL is meaningless there
 /// and the shared-cache keepalive connection already provides their lifetime
@@ -74,10 +77,18 @@ async fn configure_on_disk_durability(
     let options = options
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal);
+    let wal_error = |e: &sqlx::Error| {
+        PersistenceError::Database(format!(
+            "failed to switch SQLite database {} to WAL journal mode (the switch needs \
+             exclusive access; close other connections to the file and retry): {}",
+            options.get_filename().display(),
+            map_db_error(e)
+        ))
+    };
     let connection = SqliteConnection::connect_with(&options)
         .await
-        .map_err(|e| map_db_error(&e))?;
-    connection.close().await.map_err(|e| map_db_error(&e))?;
+        .map_err(|e| wal_error(&e))?;
+    connection.close().await.map_err(|e| wal_error(&e))?;
     Ok(options)
 }
 
