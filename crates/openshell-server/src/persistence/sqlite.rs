@@ -14,7 +14,10 @@ use openshell_core::SetResourceVersion;
 use openshell_core::paths::set_file_owner_only;
 use openshell_core::proto::Sandbox;
 use prost::Message;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePoolOptions};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions,
+    SqliteSynchronous,
+};
 use sqlx::{Connection, QueryBuilder, Row, Sqlite, SqlitePool};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -38,6 +41,58 @@ pub struct SqliteStore {
 pub(super) async fn replace_pool_connection(store: &SqliteStore) -> PersistenceResult<()> {
     let connection = store.pool.acquire().await.map_err(|e| map_db_error(&e))?;
     connection.close().await.map_err(|e| map_db_error(&e))
+}
+
+/// Apply the on-disk journal settings and switch the database file to WAL
+/// once, before the pool opens its connections.
+///
+/// The gateway's hot paths (SSH-session tokens minted and revoked around every
+/// forwarded connection, sandbox status updates) are many small autocommit
+/// writes. SQLite's default rollback journal makes each of those commits pay
+/// several `fsync` calls and blocks readers while a writer holds the lock, so
+/// under a burst of forwarded connections the whole store serializes on disk
+/// latency. WAL mode removes the reader/writer exclusion and, combined with
+/// `synchronous=NORMAL`, drops the per-commit `fsync`: a power loss or kernel
+/// crash may roll back the most recent transactions, but the database stays
+/// consistent. That is the standard WAL configuration and matches the
+/// single-node scope of the SQLite backend; deployments that need stronger
+/// durability guarantees use the Postgres backend.
+///
+/// `journal_mode=WAL` is persistent in the database file, but switching into
+/// it takes an exclusive lock that `busy_timeout` cannot wait for. The pool
+/// opens `min_connections` eagerly and concurrently, so the switch happens
+/// here on a single connection first; the pool connections then find the file
+/// already in WAL mode. `synchronous` is a per-connection setting and is
+/// applied through the options on every connection.
+///
+/// In-memory databases are left on their defaults: WAL is meaningless there
+/// and the shared-cache keepalive connection already provides their lifetime
+/// guarantees.
+async fn configure_on_disk_durability(
+    options: SqliteConnectOptions,
+) -> PersistenceResult<SqliteConnectOptions> {
+    let options = options
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal);
+    let connection = SqliteConnection::connect_with(&options)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+    connection.close().await.map_err(|e| map_db_error(&e))?;
+    Ok(options)
+}
+
+#[cfg(test)]
+pub(super) async fn journal_settings(store: &SqliteStore) -> PersistenceResult<(String, i64)> {
+    let mut connection = store.pool.acquire().await.map_err(|e| map_db_error(&e))?;
+    let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+    let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+    Ok((journal_mode, synchronous))
 }
 
 impl SqliteStore {
@@ -76,6 +131,10 @@ impl SqliteStore {
         // Capture the on-disk path before `connect_with` consumes the options
         // so we can restrict the permissions after the database is connected.
         let db_path = (!is_in_memory).then(|| options.get_filename().to_path_buf());
+
+        if !is_in_memory {
+            options = configure_on_disk_durability(options).await?;
+        }
 
         let in_memory_keepalive = if is_in_memory {
             let connection = SqliteConnection::connect_with(&options)
