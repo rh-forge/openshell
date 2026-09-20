@@ -43,7 +43,6 @@ jobs:
     env:
       BASELINE_TAG: ${{ inputs.baseline_tag }}
       PATCHED_TAG: ${{ inputs.patched_tag }}
-      OUT_ROOT: ${{ runner.temp }}/forward-sweep-out
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -70,6 +69,7 @@ jobs:
           IMAGE_TAG: ${{ env.BASELINE_TAG }}
         run: |
           set -euo pipefail
+          OUT_ROOT="${RUNNER_TEMP}/forward-sweep-out"
           export GATEWAY_IMAGE="${IMAGE_PREFIX}/odh-openshell-gateway:${IMAGE_TAG}"
           export SUPERVISOR_IMAGE="${IMAGE_PREFIX}/odh-openshell-supervisor:${IMAGE_TAG}"
           export CLI_IMAGE="${IMAGE_PREFIX}/odh-openshell-cli:${IMAGE_TAG}"
@@ -85,6 +85,7 @@ jobs:
           IMAGE_TAG: ${{ env.PATCHED_TAG }}
         run: |
           set -euo pipefail
+          OUT_ROOT="${RUNNER_TEMP}/forward-sweep-out"
           export GATEWAY_IMAGE="${IMAGE_PREFIX}/odh-openshell-gateway:${IMAGE_TAG}"
           export SUPERVISOR_IMAGE="${IMAGE_PREFIX}/odh-openshell-supervisor:${IMAGE_TAG}"
           export CLI_IMAGE="${IMAGE_PREFIX}/odh-openshell-cli:${IMAGE_TAG}"
@@ -96,6 +97,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          OUT_ROOT="${RUNNER_TEMP}/forward-sweep-out"
           if [ ! -f "${OUT_ROOT}/baseline/results.json" ] || [ ! -f "${OUT_ROOT}/patched/results.json" ]; then
             echo "::error::one or both sets produced no results.json; see the step logs"
             exit 1
