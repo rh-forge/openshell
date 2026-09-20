@@ -39,7 +39,9 @@ def main():
         ("gateway_version", "gateway --version"),
         ("journal_mode", "SQLite `PRAGMA journal_mode`"),
         ("db_sidecars", "DB sidecar files"),
+        ("fsync_p50_ms", "fdatasync 4 KiB p50 (ms)"),
         ("fsync_mean_ms", "fdatasync 4 KiB mean (ms)"),
+        ("fsync_max_ms", "fdatasync 4 KiB max (ms)"),
         ("dd_dsync", "dd oflag=dsync (200 x 4 KiB)"),
         ("limit_hits", "`connection limit reached` in forward log"),
         ("broken_pipes", "`Broken pipe` in forward log (client closed after 64 bytes)"),
@@ -48,6 +50,12 @@ def main():
         ("runner", "runner"),
     ]:
         out.append(f"| {label} | {fmt(base.get(key))} | {fmt(new.get(key))} |")
+    out.append("")
+    out.append(
+        "fdatasync figures are 200 sequential 4 KiB write+fdatasync calls in the gateway's "
+        "database directory before each set starts; the median is the steady-state cost, the "
+        "mean and max are inflated by occasional multi-ms stalls on the hosted runner disk."
+    )
     out.append("")
     out.append(
         "| scenario | baseline completed | baseline wall (s) | baseline mean/conn (ms) "
