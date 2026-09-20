@@ -20,3 +20,29 @@ on tag pushes matching `v*-forge.*` (or by dispatch) and publishes
 `ghcr.io/rh-forge/odh-openshell-{gateway,supervisor,cli}:<tag>` plus
 `:sha-<commit>`. The tag, minus the leading `v`, is stamped into every binary
 through `OPENSHELL_VERSION`, so all three report the same version string.
+
+## Forward connection sweep (`forward-sweep.yml`)
+
+`.github/workflows/forward-sweep.yml` (manual dispatch) measures the cost of
+`openshell forward service` connections end to end on a hosted runner, once
+with the opendatahub images (`quay.io/opendatahub/odh-openshell-*`, baseline)
+and once with the rh-forge images (`ghcr.io/rh-forge/odh-openshell-*`, patched:
+SQLite store in WAL + `synchronous=NORMAL`), then prints a before/after table
+in the run summary. It is the evidence for
+[NVIDIA/OpenShell#3494](https://github.com/NVIDIA/OpenShell/issues/3494).
+
+Each image set runs in its own job (`scripts/forward-sweep/run-set.sh`): the
+gateway and CLI binaries are extracted from the images; a single-node gateway
+runs on the runner with the Docker compute driver, mTLS from
+`openshell-gateway generate-certs`, and a file-backed SQLite database on the
+runner disk; the set's supervisor image is pre-pulled (the gateway extracts the
+supervisor through the Docker API, which has no registry credentials); a
+sandbox built from `python:3.13-slim` plus `iproute2` serves loopback HTTP;
+`scripts/forward-sweep/sweep.py` then opens bursts of 1, 6, 16, 32 and 64
+simultaneous connections (twice each) plus 10 sequential ones through the
+forward and records wall time, completions and mean latency. The job also
+reports the raw `fdatasync`/`dd oflag=dsync` cost of the runner disk, the
+number of `connection limit reached` refusals in the forward log, and the
+`PRAGMA journal_mode` of the gateway database (`delete` for baseline, `wal`
+for patched). Raw logs and `results.json` are uploaded as artifacts; the
+`report` job merges both into one table.

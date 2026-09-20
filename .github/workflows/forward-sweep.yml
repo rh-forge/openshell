@@ -1,0 +1,121 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: forward-sweep
+
+# Measures the per-connection cost of `openshell forward service` end to end
+# on a hosted runner, once with the opendatahub images (baseline) and once
+# with the rh-forge images (patched: SQLite store in WAL + synchronous=NORMAL),
+# and prints a before/after table. Evidence for NVIDIA/OpenShell#3494.
+#
+# Each set runs in its own job: the gateway and CLI binaries are extracted
+# from the images, a single-node gateway runs on the runner with the Docker
+# compute driver (mTLS, file-backed SQLite on the runner disk, supervisor
+# taken from that set's supervisor image), a sandbox serves loopback HTTP,
+# and scripts/forward-sweep/sweep.py opens bursts of TCP connections through
+# the forward. See scripts/forward-sweep/run-set.sh.
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_tag:
+        description: "quay.io/opendatahub/odh-openshell-* tag (baseline)"
+        required: false
+        type: string
+        default: "v0.0.116-rhaiv.0"
+      patched_tag:
+        description: "ghcr.io/rh-forge/odh-openshell-* tag (patched)"
+        required: false
+        type: string
+        default: "v0.0.116-rhaiv.0-forge.1"
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  sweep:
+    name: Sweep (${{ matrix.set }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - set: baseline
+            prefix: quay.io/opendatahub
+          - set: patched
+            prefix: ghcr.io/rh-forge
+    env:
+      SET_NAME: ${{ matrix.set }}
+      IMAGE_TAG: ${{ matrix.set == 'baseline' && inputs.baseline_tag || inputs.patched_tag }}
+      IMAGE_PREFIX: ${{ matrix.prefix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run the sweep
+        shell: bash
+        env:
+          OUT_DIR: ${{ runner.temp }}/forward-sweep-out
+        run: |
+          set -euo pipefail
+          export GATEWAY_IMAGE="${IMAGE_PREFIX}/odh-openshell-gateway:${IMAGE_TAG}"
+          export SUPERVISOR_IMAGE="${IMAGE_PREFIX}/odh-openshell-supervisor:${IMAGE_TAG}"
+          export CLI_IMAGE="${IMAGE_PREFIX}/odh-openshell-cli:${IMAGE_TAG}"
+          docker info --format 'docker {{.ServerVersion}} on {{.OperatingSystem}} ({{.Architecture}})'
+          scripts/forward-sweep/run-set.sh
+
+      - name: Upload raw outputs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: forward-sweep-${{ matrix.set }}
+          path: ${{ runner.temp }}/forward-sweep-out
+          if-no-files-found: warn
+
+  report:
+    name: Before/after report
+    needs: sweep
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: forward-sweep-*
+          path: results
+
+      - name: Render report
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -R results
+          if [ ! -f results/forward-sweep-baseline/results.json ] || [ ! -f results/forward-sweep-patched/results.json ]; then
+            echo "::error::one or both sweep jobs produced no results.json; see the sweep job logs"
+            exit 1
+          fi
+          python3 scripts/forward-sweep/report.py \
+            --baseline results/forward-sweep-baseline/results.json \
+            --patched results/forward-sweep-patched/results.json \
+            | tee results/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: forward-sweep-report
+          path: results
+          if-no-files-found: warn
