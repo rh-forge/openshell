@@ -10,6 +10,12 @@ name: forward-sweep
 #
 # Both sets run back to back on the same runner (same disk, fresh state
 # directory each) so the disk commit cost is identical for the comparison.
+# The patched gateway comes either from a build of this checkout with
+# deploy/docker/Dockerfile.gha.gateway (`patched_source: build`, the default;
+# needs no credentials, so anyone can run it) or from the published rh-forge
+# image (`patched_source: image`, org-internal package). In build mode the
+# patched set uses the public baseline CLI and supervisor images: same source
+# commit, only the gateway differs, which is exactly the change under test.
 # For each set the gateway and CLI binaries are extracted from the images, a
 # single-node gateway runs on the runner with the Docker compute driver
 # (mTLS, file-backed SQLite on the runner disk, supervisor taken from that
@@ -25,8 +31,14 @@ on:
         required: false
         type: string
         default: "v0.0.116-rhaiv.0"
+      patched_source:
+        description: "Patched gateway: build it from this checkout (public), or pull the ghcr.io/rh-forge image (org-internal)"
+        required: false
+        type: choice
+        options: [build, image]
+        default: build
       patched_tag:
-        description: "ghcr.io/rh-forge/odh-openshell-* tag (patched)"
+        description: "ghcr.io/rh-forge/odh-openshell-* tag (patched, only with patched_source=image)"
         required: false
         type: string
         default: "v0.0.116-rhaiv.0-forge.1"
@@ -39,21 +51,49 @@ jobs:
   sweep:
     name: Sweep baseline then patched
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The gateway build (bundled Z3 + full Rust build) takes roughly 30-60 min
+    # cold on 4 vCPU; the two sweeps themselves take about 5 min.
+    timeout-minutes: 150
     env:
       BASELINE_TAG: ${{ inputs.baseline_tag }}
       PATCHED_TAG: ${{ inputs.patched_tag }}
+      PATCHED_SOURCE: ${{ inputs.patched_source }}
+      BUILT_GATEWAY_IMAGE: localhost/odh-openshell-gateway:patched
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      - name: Free runner disk space
+        if: inputs.patched_source == 'build'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
+
       - name: Log in to ghcr.io
+        if: inputs.patched_source == 'image'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        if: inputs.patched_source == 'build'
+
+      - name: Build the patched gateway image from this checkout
+        if: inputs.patched_source == 'build'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build --load \
+            -t "${BUILT_GATEWAY_IMAGE}" \
+            --build-arg "OPENSHELL_VERSION=${BASELINE_TAG}-patched" \
+            -f deploy/docker/Dockerfile.gha.gateway .
+          docker run --rm --entrypoint /usr/local/bin/openshell-gateway "${BUILT_GATEWAY_IMAGE}" --version
+          docker image ls "${BUILT_GATEWAY_IMAGE}"
+          df -h /
 
       - name: Runner facts
         run: |
@@ -76,19 +116,23 @@ jobs:
           export OUT_DIR="${OUT_ROOT}/${SET_NAME}"
           scripts/forward-sweep/run-set.sh
 
-      - name: Patched (rh-forge images)
+      - name: Patched (gateway built here or rh-forge images)
         if: ${{ !cancelled() }}
         shell: bash
         env:
           SET_NAME: patched
-          IMAGE_PREFIX: ghcr.io/rh-forge
-          IMAGE_TAG: ${{ env.PATCHED_TAG }}
         run: |
           set -euo pipefail
           OUT_ROOT="${RUNNER_TEMP}/forward-sweep-out"
-          export GATEWAY_IMAGE="${IMAGE_PREFIX}/odh-openshell-gateway:${IMAGE_TAG}"
-          export SUPERVISOR_IMAGE="${IMAGE_PREFIX}/odh-openshell-supervisor:${IMAGE_TAG}"
-          export CLI_IMAGE="${IMAGE_PREFIX}/odh-openshell-cli:${IMAGE_TAG}"
+          if [ "${PATCHED_SOURCE}" = "build" ]; then
+            export GATEWAY_IMAGE="${BUILT_GATEWAY_IMAGE}"
+            export SUPERVISOR_IMAGE="quay.io/opendatahub/odh-openshell-supervisor:${BASELINE_TAG}"
+            export CLI_IMAGE="quay.io/opendatahub/odh-openshell-cli:${BASELINE_TAG}"
+          else
+            export GATEWAY_IMAGE="ghcr.io/rh-forge/odh-openshell-gateway:${PATCHED_TAG}"
+            export SUPERVISOR_IMAGE="ghcr.io/rh-forge/odh-openshell-supervisor:${PATCHED_TAG}"
+            export CLI_IMAGE="ghcr.io/rh-forge/odh-openshell-cli:${PATCHED_TAG}"
+          fi
           export OUT_DIR="${OUT_ROOT}/${SET_NAME}"
           scripts/forward-sweep/run-set.sh
 

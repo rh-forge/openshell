@@ -92,12 +92,23 @@ extract() {
   chmod +x "${dest}"
 }
 
-log "pulling ${SET_NAME} images"
-docker pull --platform linux/amd64 "${GATEWAY_IMAGE}"
-docker pull --platform linux/amd64 "${CLI_IMAGE}"
+# Images already present locally (for example a gateway image built on this
+# host) are used as they are; anything else is pulled.
+ensure_image() {
+  local image=$1
+  if docker image inspect "${image}" >/dev/null 2>&1; then
+    echo "using local image ${image}"
+  else
+    docker pull --platform linux/amd64 "${image}"
+  fi
+}
+
+log "resolving ${SET_NAME} images"
+ensure_image "${GATEWAY_IMAGE}"
+ensure_image "${CLI_IMAGE}"
 # The gateway extracts the supervisor from this image through the Docker API,
 # which carries no registry credentials, so it must already be present locally.
-docker pull --platform linux/amd64 "${SUPERVISOR_IMAGE}"
+ensure_image "${SUPERVISOR_IMAGE}"
 
 log "extracting binaries"
 extract "${GATEWAY_IMAGE}" /usr/local/bin/openshell-gateway "${GW}"
