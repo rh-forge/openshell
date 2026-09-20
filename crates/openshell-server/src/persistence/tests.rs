@@ -277,7 +277,14 @@ async fn sqlite_connect_enables_wal_and_normal_synchronous_on_disk() {
     // Force a write so the WAL sidecars exist on disk, then confirm they are
     // owner-only like the main file.
     store
-        .put("sandbox", "wal-probe", "wal-probe", "default", b"payload", None)
+        .put(
+            "sandbox",
+            "wal-probe",
+            "wal-probe",
+            "default",
+            b"payload",
+            None,
+        )
         .await
         .expect("write through the store");
     let [wal_path, shm_path] = super::sqlite::sqlite_sidecar_paths(&db_path);
@@ -292,7 +299,12 @@ async fn sqlite_connect_enables_wal_and_normal_synchronous_on_disk() {
                 .permissions()
                 .mode()
                 & 0o777;
-            assert_eq!(mode, 0o600, "{}: expected 0600, got {mode:04o}", path.display());
+            assert_eq!(
+                mode,
+                0o600,
+                "{}: expected 0600, got {mode:04o}",
+                path.display()
+            );
         }
     }
 
@@ -335,7 +347,10 @@ async fn sqlite_connect_switches_existing_rollback_journal_database_to_wal() {
     let (journal_mode, _) = super::sqlite::journal_settings(&store)
         .await
         .expect("read journal settings");
-    assert_eq!(journal_mode, "wal", "connect must switch existing files to WAL");
+    assert_eq!(
+        journal_mode, "wal",
+        "connect must switch existing files to WAL"
+    );
     store.close().await;
     assert_eq!(file_journal_mode(&db_path).await, "wal");
 }
