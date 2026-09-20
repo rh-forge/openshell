@@ -47,14 +47,14 @@ pub(super) async fn replace_pool_connection(store: &SqliteStore) -> PersistenceR
 ///
 /// The gateway's hot paths (SSH-session tokens minted and revoked around every
 /// forwarded connection, sandbox status updates) are many small autocommit
-/// writes. SQLite's default rollback journal makes each of those commits pay
+/// writes. `SQLite`'s default rollback journal makes each of those commits pay
 /// several `fsync` calls and blocks readers while a writer holds the lock, so
 /// under a burst of forwarded connections the whole store serializes on disk
 /// latency. WAL mode removes the reader/writer exclusion and, combined with
 /// `synchronous=NORMAL`, drops the per-commit `fsync`: a power loss or kernel
 /// crash may roll back the most recent transactions, but the database stays
 /// consistent. That is the standard WAL configuration and matches the
-/// single-node scope of the SQLite backend; deployments that need stronger
+/// single-node scope of the `SQLite` backend; deployments that need stronger
 /// durability guarantees use the Postgres backend.
 ///
 /// `journal_mode=WAL` is persistent in the database file, but switching into
