@@ -1,0 +1,121 @@
+# syntax=docker/dockerfile:1.4
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Supervisor image for GitHub Actions (rh-forge build of the ODH Konflux image).
+#
+# Derived from Dockerfile.konflux.supervisor at v0.0.116-rhaiv.0. The
+# supervisor binary is extracted and injected into arbitrary user containers,
+# so it MUST be a fully-static binary: glibc with `-C target-feature=+crt-static`
+# and Red Hat's glibc-static package. Differences from the Konflux file: the
+# Rust toolchain tarball is downloaded from the URL/sha256 pinned in
+# deploy/konflux/supervisor/generic-fetcher.yaml instead of the Hermeto
+# prefetch directory, cargo registry/target live in BuildKit cache mounts, and
+# `--locked` is enforced.
+#
+# Local build:
+#   docker buildx build --platform linux/amd64 \
+#     -f deploy/docker/Dockerfile.gha.supervisor \
+#     --build-arg OPENSHELL_VERSION=v0.0.116-rhaiv.0-forge.1 .
+
+ARG RUST_VERSION=1.92.0
+
+# ---------------------------------------------------------------------------
+# Toolchain (source independent; cached across builds)
+# ---------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:25a147defd01e19674714f55d17538c8dbe55d8c305fa157ecc3f9c8977b05b6 AS toolchain
+
+ARG RUST_VERSION
+ARG TARGETARCH
+# sha256 of rust-${RUST_VERSION}-<triple>.tar.xz (deploy/konflux/supervisor/generic-fetcher.yaml)
+ARG RUST_SHA256_X86_64=d2ccef59dd9f7439f2c694948069f789a044dc1addcc0803613232af8f88ee0c
+ARG RUST_SHA256_AARCH64=3e383f8b4fca710d0600d0c1de97b78281672be2cda6575ecbe1c183a12e3822
+
+RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
+        gcc gcc-c++ make cmake \
+        glibc-static \
+        openssl-devel git-core xz \
+    && dnf clean all
+
+# Install the Rust toolchain (GNU target) and record the target triple. The
+# GNU rust-std shipped with the toolchain is reused; no musl std is needed.
+RUN RUST_ARCH=$(case "${TARGETARCH}" in amd64) echo x86_64;; arm64) echo aarch64;; *) echo "${TARGETARCH}";; esac) && \
+    RUST_TRIPLE="${RUST_ARCH}-unknown-linux-gnu" && \
+    case "${RUST_ARCH}" in \
+        x86_64)  RUST_SHA256="${RUST_SHA256_X86_64}" ;; \
+        aarch64) RUST_SHA256="${RUST_SHA256_AARCH64}" ;; \
+        *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL --retry 3 -o /tmp/rust.tar.xz \
+        "https://static.rust-lang.org/dist/rust-${RUST_VERSION}-${RUST_TRIPLE}.tar.xz" && \
+    echo "${RUST_SHA256}  /tmp/rust.tar.xz" | sha256sum -c - && \
+    mkdir -p /tmp/rust-toolchain && \
+    tar xJf /tmp/rust.tar.xz -C /tmp/rust-toolchain --strip-components=1 && \
+    /tmp/rust-toolchain/install.sh --prefix=/usr/local && \
+    rm -rf /tmp/rust-toolchain /tmp/rust.tar.xz && \
+    echo "RUST_TARGET=${RUST_TRIPLE}" > /tmp/build-env
+
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+
+# ---------------------------------------------------------------------------
+# Build stage: compile supervisor (fully-static glibc binary)
+# ---------------------------------------------------------------------------
+FROM toolchain AS builder
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo/ .cargo/
+COPY crates/ crates/
+COPY proto/ proto/
+
+# Version stamped into the binary via openshell-core::VERSION; tag builds
+# pass the git tag with the leading "v" stripped. Empty otherwise.
+ARG OPENSHELL_VERSION=""
+
+# `-C target-feature=+crt-static` links glibc statically, producing a
+# fully-static (static-PIE) binary with no runtime libc dependency.
+#
+# The alias re-adds `bundled-ca-roots`, which a bare `--no-default-features`
+# would drop, moving this binary onto a trust store the distroless containers
+# it is injected into do not have.
+RUN --mount=type=cache,target=/root/.cargo/registry,id=odh-openshell-supervisor-registry \
+    --mount=type=cache,target=/build/target,id=odh-openshell-supervisor-target \
+    . /tmp/build-env && \
+    VER="${OPENSHELL_VERSION#v}" && \
+    if [ -n "$VER" ]; then export OPENSHELL_GIT_VERSION="$VER"; fi && \
+    RUSTFLAGS="-C target-feature=+crt-static" \
+    cargo build --release --locked \
+        --target "${RUST_TARGET}" \
+        --package openshell-sandbox \
+        --no-default-features \
+        --features defaults-without-telemetry && \
+    mkdir -p /build/output && \
+    cp /build/target/${RUST_TARGET}/release/openshell-sandbox /build/output/
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8@sha256:7fbeae18dc9476399f565e68255f602a3374ea8614ba3d14843565131a13ff93
+
+RUN microdnf install -y --nodocs --setopt=install_weak_deps=0 \
+        nftables \
+        iptables-nft \
+        iproute \
+        util-linux-core \
+    && microdnf clean all
+
+# Copy the fully-static binary produced by the builder stage.
+COPY --from=builder --chmod=0555 /build/output/openshell-sandbox /openshell-sandbox
+
+LABEL com.redhat.component="odh-openshell-supervisor-container" \
+      description="Statically linked (glibc) sandbox supervisor for OpenShell, injected into arbitrary user containers" \
+      summary="Statically linked (glibc) sandbox supervisor for OpenShell, injected into arbitrary user containers" \
+      name="rhoai/odh-openshell-supervisor-rhel9" \
+      maintainer="['managed-open-data-hub@redhat.com']" \
+      io.openshift.expose-services="" \
+      io.k8s.display-name="odh-openshell-supervisor" \
+      io.k8s.description="odh-openshell-supervisor" \
+      com.redhat.license_terms="https://www.redhat.com/licenses/Red_Hat_Standard_EULA_20191108.pdf"
+
+ENTRYPOINT ["/openshell-sandbox"]

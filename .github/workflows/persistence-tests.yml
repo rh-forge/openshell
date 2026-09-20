@@ -1,0 +1,38 @@
+name: persistence-tests
+
+# rh-forge: runs the openshell-server persistence test module (the SQLite
+# store, including the WAL/synchronous configuration tests) on a hosted
+# runner. Dispatch-only plus pushes to forge/** branches.
+
+on:
+  push:
+    branches: ["forge/**"]
+    paths:
+      - "crates/openshell-server/src/persistence/**"
+      - "crates/openshell-server/migrations/**"
+      - ".github/workflows/persistence-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  persistence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      OPENSHELL_TELEMETRY_ENABLED: "false"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config libssl-dev
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install "$(grep -E '^channel' rust-toolchain.toml | sed -E 's/.*"([^"]+)".*/\1/')" --profile minimal
+          rustup show active-toolchain
+      - name: Run persistence tests
+        run: |
+          cargo test -p openshell-server --features test-support,bundled-z3 persistence -- --nocapture 2>&1 | tail -n 200

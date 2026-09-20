@@ -1,0 +1,203 @@
+name: publish-odh-images
+
+# rh-forge build of the ODH OpenShell images (gateway, supervisor, cli) from
+# the GitHub Actions ports of the Konflux Dockerfiles
+# (deploy/docker/Dockerfile.gha.*), pushed to
+# ghcr.io/rh-forge/odh-openshell-{gateway,supervisor,cli}.
+#
+# Triggers:
+#   * push of a tag matching v*-forge.*  (e.g. v0.0.116-rhaiv.0-forge.1)
+#   * workflow_dispatch with `version` (tag-shaped string stamped into the
+#     binaries and used as the image tag) and optional `ref` to build from.
+# No branch-push builds and never a `latest` tag: consumers pin the version
+# tag or sha-<commit>. All three binaries report the same version string.
+
+on:
+  push:
+    tags: ["v*-forge.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp and tag, e.g. v0.0.116-rhaiv.0-forge.1 (a git tag of that name, if present, must point at the built commit)"
+        required: true
+        type: string
+      ref:
+        description: "Branch, tag or SHA to build (default: the ref this run was started from)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-odh-images-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
+
+jobs:
+  resolve:
+    name: Resolve version and commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.src.outputs.version }}
+      sha: ${{ steps.src.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-tags: true
+      - id: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="${{ inputs.version }}"
+          fi
+          if ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rhaiv\.[0-9]+-forge\.[0-9]+$ ]]; then
+            echo "::error::version '$version' must look like vX.Y.Z-rhaiv.N-forge.M"; exit 1
+          fi
+          sha="$(git rev-parse HEAD)"
+          if git rev-parse -q --verify "refs/tags/$version^{commit}" >/dev/null; then
+            tagged="$(git rev-parse "refs/tags/$version^{commit}")"
+            if [ "$tagged" != "$sha" ]; then
+              echo "::error::tag $version points at $tagged but HEAD is $sha"; exit 1
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Building $version from $sha" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build ${{ matrix.image }}
+    needs: resolve
+    runs-on: ubuntu-latest
+    # The gateway (bundled Z3 + full Rust build) is roughly 60-100 min cold on 4 vCPU.
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: gateway
+            image: odh-openshell-gateway
+          - component: supervisor
+            image: odh-openshell-supervisor
+          - component: cli
+            image: odh-openshell-cli
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ needs.resolve.outputs.version }}
+            type=raw,value=sha-${{ needs.resolve.outputs.sha }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.image }}
+            org.opencontainers.image.version=${{ needs.resolve.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.gha.${{ matrix.component }}
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            OPENSHELL_VERSION=${{ needs.resolve.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=odh-${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=odh-${{ matrix.component }},ignore-error=true
+          provenance: false
+
+      - name: Summary
+        run: echo "${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:${{ needs.resolve.outputs.version }} @ ${{ steps.push.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+
+  verify:
+    name: Verify published images
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to ghcr.io
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull, check versions, check extraction paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.resolve.outputs.version }}"
+          sha="${{ needs.resolve.outputs.sha }}"
+          expected="${version#v}"
+          declare -A BIN=(
+            [odh-openshell-gateway]=/usr/local/bin/openshell-gateway
+            [odh-openshell-supervisor]=/openshell-sandbox
+            [odh-openshell-cli]=/usr/local/bin/openshell
+          )
+          # The supervisor is injected into arbitrary containers and the CLI is
+          # copied onto hosts; both must be fully static. The gateway links glibc.
+          declare -A STATIC=( [odh-openshell-supervisor]=1 [odh-openshell-cli]=1 )
+          fail=0
+          for img in odh-openshell-gateway odh-openshell-supervisor odh-openshell-cli; do
+            ref="${IMAGE_PREFIX}/${img}:${version}"
+            docker pull --platform linux/amd64 "$ref"
+            plat="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$ref")"
+            [ "$plat" = "linux/amd64" ] || { echo "::error::$img is $plat"; fail=1; }
+
+            d1="$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')"
+            d2="$(docker buildx imagetools inspect "${IMAGE_PREFIX}/${img}:sha-${sha}" --format '{{.Manifest.Digest}}')"
+            [ "$d1" = "$d2" ] || { echo "::error::$img: $version=$d1 but sha-$sha=$d2"; fail=1; }
+
+            out="$(docker run --rm --entrypoint "${BIN[$img]}" "$ref" --version)"
+            got="${out##* }"
+            echo "$img: $out"
+            [ "$got" = "$expected" ] || { echo "::error::$img reports '$got', expected '$expected'"; fail=1; }
+
+            cid="$(docker create "$ref")"
+            docker cp "$cid:${BIN[$img]}" "./$img.bin"
+            docker rm -f "$cid" >/dev/null
+            test -x "./$img.bin" || { echo "::error::$img: extracted binary not executable"; fail=1; }
+            info="$(file -b "./$img.bin")"; echo "$img: $info"
+            echo "$info" | grep -q 'x86-64' || { echo "::error::$img: not x86-64"; fail=1; }
+            if [ -n "${STATIC[$img]:-}" ]; then
+              echo "$info" | grep -Eq 'static(ally|-pie) linked' || { echo "::error::$img: not statically linked"; fail=1; }
+            fi
+          done
+          exit $fail
