@@ -8,12 +8,14 @@ name: forward-sweep
 # with the rh-forge images (patched: SQLite store in WAL + synchronous=NORMAL),
 # and prints a before/after table. Evidence for NVIDIA/OpenShell#3494.
 #
-# Each set runs in its own job: the gateway and CLI binaries are extracted
-# from the images, a single-node gateway runs on the runner with the Docker
-# compute driver (mTLS, file-backed SQLite on the runner disk, supervisor
-# taken from that set's supervisor image), a sandbox serves loopback HTTP,
-# and scripts/forward-sweep/sweep.py opens bursts of TCP connections through
-# the forward. See scripts/forward-sweep/run-set.sh.
+# Both sets run back to back on the same runner (same disk, fresh state
+# directory each) so the disk commit cost is identical for the comparison.
+# For each set the gateway and CLI binaries are extracted from the images, a
+# single-node gateway runs on the runner with the Docker compute driver
+# (mTLS, file-backed SQLite on the runner disk, supervisor taken from that
+# set's supervisor image), a sandbox serves loopback HTTP, and
+# scripts/forward-sweep/sweep.py opens bursts of TCP connections through the
+# forward. See scripts/forward-sweep/run-set.sh.
 
 on:
   workflow_dispatch:
@@ -35,21 +37,13 @@ permissions:
 
 jobs:
   sweep:
-    name: Sweep (${{ matrix.set }})
+    name: Sweep baseline then patched
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - set: baseline
-            prefix: quay.io/opendatahub
-          - set: patched
-            prefix: ghcr.io/rh-forge
+    timeout-minutes: 60
     env:
-      SET_NAME: ${{ matrix.set }}
-      IMAGE_TAG: ${{ matrix.set == 'baseline' && inputs.baseline_tag || inputs.patched_tag }}
-      IMAGE_PREFIX: ${{ matrix.prefix }}
+      BASELINE_TAG: ${{ inputs.baseline_tag }}
+      PATCHED_TAG: ${{ inputs.patched_tag }}
+      OUT_ROOT: ${{ runner.temp }}/forward-sweep-out
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -62,60 +56,59 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Run the sweep
+      - name: Runner facts
+        run: |
+          docker info --format 'docker {{.ServerVersion}} on {{.OperatingSystem}} ({{.Architecture}}, {{.NCPU}} cpu, {{.MemTotal}} bytes)'
+          df -hT "$RUNNER_TEMP" | tail -n 1
+          uname -r
+
+      - name: Baseline (opendatahub images)
         shell: bash
         env:
-          OUT_DIR: ${{ runner.temp }}/forward-sweep-out
+          SET_NAME: baseline
+          IMAGE_PREFIX: quay.io/opendatahub
+          IMAGE_TAG: ${{ env.BASELINE_TAG }}
         run: |
           set -euo pipefail
           export GATEWAY_IMAGE="${IMAGE_PREFIX}/odh-openshell-gateway:${IMAGE_TAG}"
           export SUPERVISOR_IMAGE="${IMAGE_PREFIX}/odh-openshell-supervisor:${IMAGE_TAG}"
           export CLI_IMAGE="${IMAGE_PREFIX}/odh-openshell-cli:${IMAGE_TAG}"
-          docker info --format 'docker {{.ServerVersion}} on {{.OperatingSystem}} ({{.Architecture}})'
+          export OUT_DIR="${OUT_ROOT}/${SET_NAME}"
           scripts/forward-sweep/run-set.sh
+
+      - name: Patched (rh-forge images)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          SET_NAME: patched
+          IMAGE_PREFIX: ghcr.io/rh-forge
+          IMAGE_TAG: ${{ env.PATCHED_TAG }}
+        run: |
+          set -euo pipefail
+          export GATEWAY_IMAGE="${IMAGE_PREFIX}/odh-openshell-gateway:${IMAGE_TAG}"
+          export SUPERVISOR_IMAGE="${IMAGE_PREFIX}/odh-openshell-supervisor:${IMAGE_TAG}"
+          export CLI_IMAGE="${IMAGE_PREFIX}/odh-openshell-cli:${IMAGE_TAG}"
+          export OUT_DIR="${OUT_ROOT}/${SET_NAME}"
+          scripts/forward-sweep/run-set.sh
+
+      - name: Before/after report
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f "${OUT_ROOT}/baseline/results.json" ] || [ ! -f "${OUT_ROOT}/patched/results.json" ]; then
+            echo "::error::one or both sets produced no results.json; see the step logs"
+            exit 1
+          fi
+          python3 scripts/forward-sweep/report.py \
+            --baseline "${OUT_ROOT}/baseline/results.json" \
+            --patched "${OUT_ROOT}/patched/results.json" \
+            | tee "${OUT_ROOT}/report.md" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload raw outputs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: forward-sweep-${{ matrix.set }}
+          name: forward-sweep
           path: ${{ runner.temp }}/forward-sweep-out
-          if-no-files-found: warn
-
-  report:
-    name: Before/after report
-    needs: sweep
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: forward-sweep-*
-          path: results
-
-      - name: Render report
-        shell: bash
-        run: |
-          set -euo pipefail
-          ls -R results
-          if [ ! -f results/forward-sweep-baseline/results.json ] || [ ! -f results/forward-sweep-patched/results.json ]; then
-            echo "::error::one or both sweep jobs produced no results.json; see the sweep job logs"
-            exit 1
-          fi
-          python3 scripts/forward-sweep/report.py \
-            --baseline results/forward-sweep-baseline/results.json \
-            --patched results/forward-sweep-patched/results.json \
-            | tee results/report.md >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload report
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: forward-sweep-report
-          path: results
           if-no-files-found: warn

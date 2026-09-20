@@ -42,7 +42,9 @@ def main():
         ("fsync_mean_ms", "fdatasync 4 KiB mean (ms)"),
         ("dd_dsync", "dd oflag=dsync (200 x 4 KiB)"),
         ("limit_hits", "`connection limit reached` in forward log"),
+        ("broken_pipes", "`Broken pipe` in forward log (client closed after 64 bytes)"),
         ("forward_warnings", "forward warnings total"),
+        ("slow_statements", "sqlx `slow statement` warnings in gateway log"),
         ("runner", "runner"),
     ]:
         out.append(f"| {label} | {fmt(base.get(key))} | {fmt(new.get(key))} |")

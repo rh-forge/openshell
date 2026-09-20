@@ -204,9 +204,14 @@ done
 "${CLI}" sandbox list
 
 log "creating sandbox ${SANDBOX_NAME} serving HTTP on 127.0.0.1:${TARGET_PORT}"
+# `python3 -m http.server` listens with a backlog of 5; once the gateway stops
+# serializing connections on disk commits, a burst of 16+ overflows that queue
+# and the supervisor's connect only succeeds after a 1 s SYN retransmit, which
+# would show up as a fake 1 s floor. Serve the same handler with a large backlog.
+PROBE_SERVER="import http.server as h; h.ThreadingHTTPServer.request_queue_size = 1024; h.ThreadingHTTPServer(('127.0.0.1', ${TARGET_PORT}), h.SimpleHTTPRequestHandler).serve_forever()"
 timeout 600 "${CLI}" sandbox create --name "${SANDBOX_NAME}" --from "${PROBE_IMAGE}" \
   --no-auto-providers --detach -- \
-  sh -lc "exec python3 -m http.server ${TARGET_PORT} --bind 127.0.0.1"
+  sh -lc "exec python3 -c \"${PROBE_SERVER}\""
 for i in $(seq 1 180); do
   phase="$("${CLI}" sandbox get "${SANDBOX_NAME}" -o json 2>/dev/null \
     | python3 -c 'import json,sys; print(json.load(sys.stdin).get("phase",""))' 2>/dev/null || true)"
@@ -233,8 +238,10 @@ sleep 3
 
 log "post-run evidence"
 LIMIT_HITS="$(grep -c 'connection limit reached' "${FORWARD_LOG}" || true)"
+BROKEN_PIPES="$(grep -c 'Broken pipe' "${FORWARD_LOG}" || true)"
 FORWARD_WARNINGS="$(grep -c 'service forward' "${FORWARD_LOG}" || true)"
-echo "connection limit reached: ${LIMIT_HITS} (forward warnings: ${FORWARD_WARNINGS})"
+SLOW_STATEMENTS="$(grep -c 'slow statement' "${GATEWAY_LOG}" || true)"
+echo "connection limit reached: ${LIMIT_HITS}; broken pipe (client closed after 64 bytes): ${BROKEN_PIPES}; forward warnings: ${FORWARD_WARNINGS}; sqlx slow statements: ${SLOW_STATEMENTS}"
 ls -la "${DB_DIR}"
 JOURNAL_MODE="$(python3 -c '
 import sqlite3, sys
@@ -248,6 +255,7 @@ SET_NAME="${SET_NAME}" GATEWAY_IMAGE="${GATEWAY_IMAGE}" SUPERVISOR_IMAGE="${SUPE
 CLI_IMAGE="${CLI_IMAGE}" GATEWAY_VERSION="${GATEWAY_VERSION}" CLI_VERSION="${CLI_VERSION}" \
 JOURNAL_MODE="${JOURNAL_MODE}" SIDECARS="${SIDECARS}" DD_OUT="${DD_OUT}" \
 LIMIT_HITS="${LIMIT_HITS}" FORWARD_WARNINGS="${FORWARD_WARNINGS}" \
+BROKEN_PIPES="${BROKEN_PIPES}" SLOW_STATEMENTS="${SLOW_STATEMENTS}" \
 python3 - "${WORK_DIR}" "${OUT_DIR}" <<'PY'
 import json, os, platform, sys
 work, out = sys.argv[1], sys.argv[2]
@@ -269,6 +277,8 @@ result = {
     "dd_dsync": env["DD_OUT"],
     "limit_hits": int(env["LIMIT_HITS"] or 0),
     "forward_warnings": int(env["FORWARD_WARNINGS"] or 0),
+    "broken_pipes": int(env["BROKEN_PIPES"] or 0),
+    "slow_statements": int(env["SLOW_STATEMENTS"] or 0),
     "runner": f"{platform.node()} {platform.release()}",
     "sweep": sweep,
 }
@@ -278,7 +288,8 @@ lines = [
     "",
     f"- gateway: `{result['gateway_version']}`, journal_mode: **{result['journal_mode']}**, sidecars: `{result['db_sidecars']}`",
     f"- fdatasync 4 KiB: mean {result['fsync_mean_ms']} ms, p50 {result['fsync_p50_ms']} ms, max {result['fsync_max_ms']} ms; dd oflag=dsync: {result['dd_dsync']}",
-    f"- `connection limit reached` in forward log: {result['limit_hits']}",
+    f"- `connection limit reached` in forward log: {result['limit_hits']} (other forward warnings: {result['forward_warnings'] - result['limit_hits']}, of which `Broken pipe` from the client closing after 64 bytes: {result['broken_pipes']})",
+    f"- sqlx `slow statement` warnings in gateway log: {result['slow_statements']}",
     "",
 ]
 lines += open(os.path.join(work, "sweep.txt")).read().split("\n\n", 1)[1].splitlines()

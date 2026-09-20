@@ -31,8 +31,10 @@ SQLite store in WAL + `synchronous=NORMAL`), then prints a before/after table
 in the run summary. It is the evidence for
 [NVIDIA/OpenShell#3494](https://github.com/NVIDIA/OpenShell/issues/3494).
 
-Each image set runs in its own job (`scripts/forward-sweep/run-set.sh`): the
-gateway and CLI binaries are extracted from the images; a single-node gateway
+Both image sets run back to back on the same runner, each with a fresh state
+directory (`scripts/forward-sweep/run-set.sh`), so the disk commit cost is the
+same for both. Per set: the gateway and CLI binaries are extracted from the
+images; a single-node gateway
 runs on the runner with the Docker compute driver, mTLS from
 `openshell-gateway generate-certs`, and a file-backed SQLite database on the
 runner disk; the set's supervisor image is pre-pulled (the gateway extracts the
@@ -44,5 +46,6 @@ forward and records wall time, completions and mean latency. The job also
 reports the raw `fdatasync`/`dd oflag=dsync` cost of the runner disk, the
 number of `connection limit reached` refusals in the forward log, and the
 `PRAGMA journal_mode` of the gateway database (`delete` for baseline, `wal`
-for patched). Raw logs and `results.json` are uploaded as artifacts; the
-`report` job merges both into one table.
+for patched) and the number of sqlx `slow statement` warnings the gateway
+logged. Raw logs and `results.json` are uploaded as one artifact; the final
+step merges both sets into one table in the run summary.
