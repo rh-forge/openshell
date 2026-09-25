@@ -5881,7 +5881,8 @@ mod tests {
                 "google-vertex-ai",
                 "nvidia",
                 "openai",
-                "pypi"
+                "pypi",
+                "slack"
             ]
         );
 
