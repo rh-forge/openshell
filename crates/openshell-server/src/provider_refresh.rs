@@ -1659,12 +1659,11 @@ fn classify_oauth_token_error(
     // Issuer-specific vocabulary is only consulted for errors that arrived in
     // a 2xx envelope (see `request_token`); RFC 6749 error responses keep the
     // RFC-only table below so no existing 4xx classification changes.
-    if status.is_success() {
-        if let Some(failure) =
+    if status.is_success()
+        && let Some(failure) =
             classify_issuer_token_error(error_response.error.as_str(), grant_kind)
-        {
-            return failure;
-        }
+    {
+        return failure;
     }
 
     match error_response.error.as_str() {
