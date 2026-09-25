@@ -1656,8 +1656,15 @@ fn classify_oauth_token_error(
         );
     };
 
-    if let Some(failure) = classify_issuer_token_error(error_response.error.as_str(), grant_kind) {
-        return failure;
+    // Issuer-specific vocabulary is only consulted for errors that arrived in
+    // a 2xx envelope (see `request_token`); RFC 6749 error responses keep the
+    // RFC-only table below so no existing 4xx classification changes.
+    if status.is_success() {
+        if let Some(failure) =
+            classify_issuer_token_error(error_response.error.as_str(), grant_kind)
+        {
+            return failure;
+        }
     }
 
     match error_response.error.as_str() {
@@ -2612,6 +2619,21 @@ mod tests {
                 RefreshRetrySchedule::Configuration
             );
         }
+    }
+
+    #[test]
+    fn issuer_error_names_on_rfc_error_responses_stay_unrecognized() {
+        let failure = classify_oauth_token_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            br#"{"error":"token_expired"}"#,
+            OAuthGrantKind::UserRefreshToken,
+        );
+        assert_eq!(
+            failure.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::Investigate
+        );
+        assert_eq!(failure.failure_code, "oauth_unrecognized_error");
+        assert_eq!(failure.retry_schedule, RefreshRetrySchedule::Short);
     }
 
     #[test]
