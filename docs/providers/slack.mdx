@@ -41,9 +41,10 @@ configuration below.
 
 <Warning>
 Slack refresh tokens are single use. Every refresh returns a new refresh
-token and revokes the previous one after a short grace period, so only the
-gateway should refresh a rotating grant. Do not reuse the refresh token you
-hand to the gateway elsewhere.
+token and invalidates the previous one, so only the gateway should refresh a
+rotating grant. Do not reuse the refresh token you hand to the gateway
+elsewhere, and avoid manual `refresh rotate` calls that could race the
+gateway's own scheduled refresh.
 </Warning>
 
 ## Create the Provider
@@ -68,11 +69,10 @@ openshell provider refresh configure my-slack \
 ```
 
 The profile owns the token endpoint, the 43200-second lifetime cap, and a
-21600-second refresh lead time. Rotate once to confirm the material works and
-to move the grant onto a gateway-issued token pair:
+21600-second refresh lead time. The gateway refreshes the token on its own
+schedule; confirm the configuration took effect with:
 
 ```shell
-openshell provider refresh rotate my-slack --credential-key SLACK_USER_TOKEN
 openshell provider refresh status my-slack
 ```
 
