@@ -42,10 +42,10 @@ discovery:
   credentials: [user_token]
 
 endpoints:
-  # Slack Web API methods are POST even for reads, so the read-only
-  # method preset is unusable; read-write is the minimum working preset.
+  # Slack's read methods accept GET, so the read-only preset covers reads
+  # while keeping write methods denied until a policy explicitly allows them.
   - host: slack.com
     port: 443
     protocol: rest
-    access: read-write
+    access: read-only
     enforcement: enforce
