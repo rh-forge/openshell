@@ -87,19 +87,19 @@ field. The gateway classifies those like standard OAuth errors:
 | `invalid_client_id`, `bad_client_secret` | `oauth_invalid_client` | `fix_configuration`: correct the client material. |
 | `ratelimited` and other transient Slack errors | `oauth_token_endpoint_retryable` | `retry`: the gateway retries automatically. |
 
-The Slack error name is kept in the provider error subtype of the refresh
-status so operators can see the original cause.
+The Slack error name is recorded as `provider_error_subtype` in the refresh
+status API and echoed in the `LAST_ERROR` text of the status table.
 
 ## Use the Provider in a Sandbox
 
 ```shell
 openshell sandbox create --name slack-sandbox --provider my-slack
 openshell sandbox exec slack-sandbox -- \
-  curl -s -X POST https://slack.com/api/auth.test \
+  curl -s https://slack.com/api/auth.test \
     -H "Authorization: Bearer $SLACK_USER_TOKEN"
 ```
 
 The sandbox sees only the placeholder; the sandbox proxy substitutes the
-current access token for requests to `slack.com`. Restrict the allowed
-methods with a custom profile that adds `rules` for the Slack Web API paths
-your workload needs.
+current access token for requests to `slack.com`. The profile allows read
+methods only; add `rules` for the specific Slack Web API paths your workload
+needs, including any write methods such as `chat.postMessage`.
