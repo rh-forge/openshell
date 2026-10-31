@@ -1710,7 +1710,10 @@ pub async fn service_forward_tcp(
     // Set once this forward learns that the gateway predates principal-authorized
     // TCP forwards and still requires a `CreateSshSession` token per connection.
     let legacy_session_tokens = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut health_check = tokio::time::interval(Duration::from_secs(2));
+    // The health check only re-verifies that the sandbox is still Ready, so a
+    // stopped sandbox ends the forward within one interval.
+    let mut health_check =
+        tokio::time::interval(Duration::from_secs(forward_health_check_interval_secs()));
     health_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
@@ -1767,6 +1770,37 @@ async fn create_forward_session_token(
         .await
         .map_err(ForwardTcpConnectionError::from_status)?;
     Ok(response.into_inner().token)
+}
+
+/// Default interval (seconds) between service-forward sandbox readiness checks.
+///
+/// Override at runtime with the `OPENSHELL_FORWARD_HEALTH_CHECK_SECS`
+/// environment variable.
+const DEFAULT_FORWARD_HEALTH_CHECK_SECS: u64 = 15;
+
+fn forward_health_check_interval_secs() -> u64 {
+    let Ok(value) = std::env::var("OPENSHELL_FORWARD_HEALTH_CHECK_SECS") else {
+        return DEFAULT_FORWARD_HEALTH_CHECK_SECS;
+    };
+    match value.parse::<u64>() {
+        Ok(interval) if interval > 0 => interval,
+        Ok(_) => {
+            tracing::warn!(
+                default_interval_secs = DEFAULT_FORWARD_HEALTH_CHECK_SECS,
+                "Ignoring zero forward health check interval"
+            );
+            DEFAULT_FORWARD_HEALTH_CHECK_SECS
+        }
+        Err(error) => {
+            tracing::warn!(
+                interval = %value,
+                error = %error,
+                default_interval_secs = DEFAULT_FORWARD_HEALTH_CHECK_SECS,
+                "Ignoring invalid forward health check interval"
+            );
+            DEFAULT_FORWARD_HEALTH_CHECK_SECS
+        }
+    }
 }
 
 /// Older gateways reject a token-less `ForwardTcp` init with this
@@ -6043,10 +6077,11 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 #[cfg(test)]
 mod tests {
     use super::{
-        PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
-        dockerfile_sources_supported_for_gateway, format_endpoint, format_log_line,
-        forward_requires_session_token, git_sync_files, has_main_process_result,
-        parse_cli_setting_value, parse_credential_expiry_cli_value, parse_driver_config_json,
+        DEFAULT_FORWARD_HEALTH_CHECK_SECS, PolicyGetView, ProvisioningStep,
+        build_sandbox_resource_limits, dockerfile_sources_supported_for_gateway, format_endpoint,
+        format_log_line, forward_health_check_interval_secs, forward_requires_session_token,
+        git_sync_files, has_main_process_result, parse_cli_setting_value,
+        parse_credential_expiry_cli_value, parse_driver_config_json,
         parse_secret_material_env_pairs, policy_revision_list_json, policy_revision_to_json,
         provisioning_timeout_message, ready_false_condition_message, resolve_from,
         sandbox_should_persist, sandbox_upload_plan, service_endpoint_to_json,
@@ -6214,6 +6249,40 @@ mod tests {
     fn parse_credential_pairs_accepts_key_value_form() {
         let parsed = parse_credential_pairs(&["API_KEY=abc123".to_string()]).expect("parse");
         assert_eq!(parsed.get("API_KEY"), Some(&"abc123".to_string()));
+    }
+
+    #[test]
+    fn forward_health_check_interval_defaults_to_fifteen_seconds() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::unset("OPENSHELL_FORWARD_HEALTH_CHECK_SECS");
+        assert_eq!(DEFAULT_FORWARD_HEALTH_CHECK_SECS, 15);
+        assert_eq!(forward_health_check_interval_secs(), 15);
+    }
+
+    #[test]
+    fn forward_health_check_interval_uses_env_override() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::set("OPENSHELL_FORWARD_HEALTH_CHECK_SECS", "4");
+        assert_eq!(forward_health_check_interval_secs(), 4);
+    }
+
+    #[test]
+    fn forward_health_check_interval_rejects_zero_and_invalid_values() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for value in ["0", "abc", "-3", ""] {
+            let _guard = EnvVarGuard::set("OPENSHELL_FORWARD_HEALTH_CHECK_SECS", value);
+            assert_eq!(
+                forward_health_check_interval_secs(),
+                DEFAULT_FORWARD_HEALTH_CHECK_SECS,
+                "{value:?} should fall back to the default"
+            );
+        }
     }
 
     #[test]

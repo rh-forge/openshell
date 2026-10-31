@@ -140,11 +140,26 @@ fn log_response<B>(res: &Response<B>, latency: Duration, span: &Span) {
     if status.is_server_error() {
         crate::otel_tracing::mark_error(span);
     }
-    tracing::info!(
-        status = status.as_u16(),
-        latency_ms = latency.as_millis(),
-        "response"
-    );
+    // Successful responses are logged at DEBUG: fixed-interval pollers (e.g.
+    // `openshell forward` readiness checks) otherwise flood the journal with
+    // one INFO line per call. Failures stay at INFO.
+    let latency_ms = latency.as_millis();
+    if response_level(status, parse_grpc_status(res.headers())) == tracing::Level::DEBUG {
+        tracing::debug!(status = status.as_u16(), latency_ms, "response");
+    } else {
+        tracing::info!(status = status.as_u16(), latency_ms, "response");
+    }
+}
+
+/// Log level for the per-request `response` event: DEBUG for a non-5xx
+/// response whose gRPC status (if present in the headers) is OK, INFO
+/// otherwise.
+fn response_level(status: StatusCode, grpc_status: Option<i64>) -> tracing::Level {
+    if status.is_server_error() || grpc_status.is_some_and(|code| code != 0) {
+        tracing::Level::INFO
+    } else {
+        tracing::Level::DEBUG
+    }
 }
 
 fn record_response_trailers(
@@ -157,12 +172,15 @@ fn record_response_trailers(
     }
 }
 
-fn record_grpc_status(headers: &http::HeaderMap, span: &Span) {
-    let Some(code) = headers
+fn parse_grpc_status(headers: &http::HeaderMap) -> Option<i64> {
+    headers
         .get("grpc-status")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<i64>().ok())
-    else {
+}
+
+fn record_grpc_status(headers: &http::HeaderMap, span: &Span) {
+    let Some(code) = parse_grpc_status(headers) else {
         return;
     };
 
@@ -1469,6 +1487,38 @@ mod tests {
         assert_eq!(
             *observed.lock().unwrap(),
             Some(GatewayListenerScope::Primary)
+        );
+    }
+
+    #[test]
+    fn response_level_is_debug_for_success_and_info_for_failure() {
+        use tracing::Level;
+
+        let ok_grpc = Response::builder()
+            .status(StatusCode::OK)
+            .header("grpc-status", "0")
+            .body(())
+            .unwrap();
+        let denied_grpc = Response::builder()
+            .status(StatusCode::OK)
+            .header("grpc-status", "7")
+            .body(())
+            .unwrap();
+        let plain = Response::builder().status(StatusCode::OK).body(()).unwrap();
+        let level =
+            |res: &Response<()>| response_level(res.status(), parse_grpc_status(res.headers()));
+
+        assert_eq!(level(&ok_grpc), Level::DEBUG);
+        assert_eq!(level(&plain), Level::DEBUG);
+        assert_eq!(response_level(StatusCode::NOT_FOUND, None), Level::DEBUG);
+        assert_eq!(level(&denied_grpc), Level::INFO);
+        assert_eq!(
+            response_level(StatusCode::INTERNAL_SERVER_ERROR, None),
+            Level::INFO
+        );
+        assert_eq!(
+            response_level(StatusCode::BAD_GATEWAY, Some(0)),
+            Level::INFO
         );
     }
 

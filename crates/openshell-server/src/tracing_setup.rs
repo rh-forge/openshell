@@ -7,6 +7,8 @@
 //! `OpenShell` product telemetry collected for maintainers is handled by
 //! [`crate::telemetry`].
 
+use std::io::IsTerminal;
+
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
@@ -33,6 +35,12 @@ impl TracingHandle {
             tracing::warn!(error = %err, "compute-driver OTLP tracer provider shutdown failed");
         }
     }
+}
+
+/// Colour the fmt layer only on an interactive terminal without `NO_COLOR`;
+/// under journald the escape codes are stored verbatim in every line.
+fn stdout_ansi(stdout_is_terminal: bool, no_color: bool) -> bool {
+    stdout_is_terminal && !no_color
 }
 
 pub fn install(
@@ -62,7 +70,10 @@ pub fn install(
 
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_ansi(stdout_ansi(
+            std::io::stdout().is_terminal(),
+            std::env::var_os("NO_COLOR").is_some(),
+        )))
         .with(tracing_log_bus.layer())
         .with(
             tracer_provider
@@ -83,4 +94,17 @@ pub fn install(
         },
         setup_error.or(driver_setup_error),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stdout_ansi;
+
+    #[test]
+    fn ansi_only_on_terminal_without_no_color() {
+        assert!(stdout_ansi(true, false));
+        assert!(!stdout_ansi(true, true));
+        assert!(!stdout_ansi(false, false));
+        assert!(!stdout_ansi(false, true));
+    }
 }
